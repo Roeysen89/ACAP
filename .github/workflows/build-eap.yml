@@ -7,26 +7,31 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [aarch64, armv7hf]
     steps:
       - name: Hent koden
         uses: actions/checkout@v4
 
-      - name: Bygg .eap for ${{ matrix.arch }}
+      - name: Vis filstruktur (for feilsoeking)
         run: |
-          docker build --build-arg ARCH=${{ matrix.arch }} -t frb:${{ matrix.arch }} .
-          cid=$(docker create frb:${{ matrix.arch }})
+          echo "== innhold paa toppnivaa =="
+          ls -la
+          echo "== hele treet =="
+          ls -R
+
+      - name: Bygg .eap (aarch64)
+        run: |
+          docker build --build-arg ARCH=aarch64 -t frb:aarch64 .
+          cid=$(docker create frb:aarch64)
           mkdir -p dist
           docker cp "$cid:/opt/app" ./_out
           docker rm "$cid"
           cp ./_out/*.eap dist/ 2>/dev/null || cp ./_out/app/*.eap dist/ 2>/dev/null || true
+          echo "== resultat =="
           ls -l dist/
 
       - name: Last opp .eap som nedlastbar fil
         uses: actions/upload-artifact@v4
         with:
-          name: flow_raw_backup-${{ matrix.arch }}
+          name: flow_raw_backup-aarch64
           path: dist/*.eap
           if-no-files-found: error
