@@ -54,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.1.5"
+#define APP_VERSION "1.1.6"
 
 /* ============================ logging ============================ */
 
@@ -942,26 +942,35 @@ static void enforce_cap(const char *base, long long max_bytes){
 }
 
 /* Velg en skrivbar SD-sti. Returnerer 1 og setter cfg->output_dir, ellers 0.
- * Skriver ALDRI til intern flash her — kun SD-kortet. */
+ * Det ekte SD-kortet (ext4) er montert paa /var/spool/storage/SD_DISK.
+ * /var/spool er en tmpfs (RAM), saa /var/spool/storage/areas/SD_DISK (uten egen
+ * mount) er IKKE kortet — derfor brukes den aldri. For aa unngaa aa lande paa
+ * et lite RAM-/flash-omraade kreves dessuten GB-skala ledig plass (ekte SD). */
+#ifndef MIN_SD_FREE
+#define MIN_SD_FREE (2LL*1024*1024*1024)   /* >=2 GB => ekte SD-kort, ikke tmpfs/flash */
+#endif
 static int ensure_sd_storage(config_t *cfg){
 #ifdef HOST_TEST
     if(getenv("FRB_NO_SD")) return 0;  /* testhjelp: simuler manglende SD */
 #endif
-    const char *cands[3]; int nc=0;
-    if(strstr(cfg->output_dir,"/storage/")) cands[nc++]=cfg->output_dir;  /* konfigurert SD-sti foerst */
-    cands[nc++]="/var/spool/storage/areas/SD_DISK/flow_raw_backup";
-    cands[nc++]="/var/spool/storage/SD_DISK/flow_raw_backup";
+    const char *cands[2]; int nc=0;
+    if(strstr(cfg->output_dir,"/storage/SD_DISK")) cands[nc++]=cfg->output_dir;  /* konfigurert ekte SD-sti */
+    cands[nc++]="/var/spool/storage/SD_DISK/flow_raw_backup";                     /* ekte ext4-montering */
+    const char *best=NULL; long long best_free=-1;
     for(int i=0;i<nc;i++){
         if(!cands[i]||!cands[i][0]) continue;
         if(mkpath(cands[i],0755)!=0) continue;
         char tf[PATH_MAX]; snprintf(tf,sizeof(tf),"%s/.wtest",cands[i]);
-        if(atomic_write(tf,(const unsigned char*)"ok",2)==0){
-            unlink(tf);
-            if(strcmp(cfg->output_dir,cands[i])!=0) snprintf(cfg->output_dir,sizeof(cfg->output_dir),"%s",cands[i]);
-            return 1;
-        }
+        if(atomic_write(tf,(const unsigned char*)"ok",2)!=0) continue;
+        unlink(tf);
+        long long fb=free_bytes(cands[i]);
+        if(fb>best_free){ best_free=fb; best=cands[i]; }
     }
-    return 0;
+    if(best && best_free>=MIN_SD_FREE){
+        if(strcmp(cfg->output_dir,best)!=0) snprintf(cfg->output_dir,sizeof(cfg->output_dir),"%s",best);
+        return 1;
+    }
+    return 0;  /* ingen ekte SD => noedbuffer haandterer det i hovedloekka */
 }
 
 static volatile sig_atomic_t g_stop=0;
