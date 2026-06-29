@@ -1,0 +1,32 @@
+name: Bygg ACAP .eap
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [aarch64, armv7hf]
+    steps:
+      - name: Hent koden
+        uses: actions/checkout@v4
+
+      - name: Bygg .eap for ${{ matrix.arch }}
+        run: |
+          docker build --build-arg ARCH=${{ matrix.arch }} -t frb:${{ matrix.arch }} .
+          cid=$(docker create frb:${{ matrix.arch }})
+          mkdir -p dist
+          docker cp "$cid:/opt/app" ./_out
+          docker rm "$cid"
+          cp ./_out/*.eap dist/ 2>/dev/null || cp ./_out/app/*.eap dist/ 2>/dev/null || true
+          ls -l dist/
+
+      - name: Last opp .eap som nedlastbar fil
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow_raw_backup-${{ matrix.arch }}
+          path: dist/*.eap
+          if-no-files-found: error
