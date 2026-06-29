@@ -54,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.1.2"
+#define APP_VERSION "1.1.3"
 
 /* ============================ logging ============================ */
 
@@ -311,8 +311,9 @@ static int gzip_buffer(const unsigned char *in, size_t inlen, unsigned char **ou
 static int mkpath(const char *path, mode_t mode) {
     char tmp[PATH_MAX]; snprintf(tmp,sizeof(tmp),"%s",path);
     size_t n=strlen(tmp);
-    for (size_t i=1;i<n;i++) if (tmp[i]=='/') { tmp[i]=0; if(mkdir(tmp,mode)<0 && errno!=EEXIST) return -1; tmp[i]='/'; }
+    for (size_t i=1;i<n;i++) if (tmp[i]=='/') { tmp[i]=0; if(mkdir(tmp,mode)<0 && errno!=EEXIST) return -1; chmod(tmp,mode); tmp[i]='/'; }
     if (mkdir(tmp,mode)<0 && errno!=EEXIST) return -1;
+    chmod(tmp,mode);  /* tving mode uavhengig av umask (ignorer feil paa dirs vi ikke eier) */
     return 0;
 }
 
@@ -320,6 +321,7 @@ static int atomic_write(const char *path, const unsigned char *data, size_t len)
     char tmp[PATH_MAX]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     int fd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0644);
     if (fd < 0) return -1;
+    fchmod(fd, 0644);  /* tving 0644 uavhengig av umask, slik at SSH-bruker kan lese */
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, data+off, len-off);
@@ -332,6 +334,25 @@ static int atomic_write(const char *path, const unsigned char *data, size_t len)
     char dir[PATH_MAX]; snprintf(dir,sizeof(dir),"%s",path);
     char *sl = strrchr(dir,'/'); if (sl) { *sl=0; int dfd=open(dir,O_RDONLY); if(dfd>=0){ fsync(dfd); close(dfd);} }
     return 0;
+}
+
+/* engangs-reparasjon: gjoer hele treet lesbart for andre brukere (SSH-pipeline) */
+static void repair_perms(const char *path) {
+    struct stat st;
+    if (lstat(path,&st)!=0) return;
+    if (S_ISDIR(st.st_mode)) {
+        chmod(path,0755);
+        DIR *d=opendir(path); if(!d) return;
+        struct dirent *e;
+        while ((e=readdir(d))) {
+            if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue;
+            char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/%s",path,e->d_name);
+            repair_perms(p);
+        }
+        closedir(d);
+    } else if (S_ISREG(st.st_mode)) {
+        chmod(path,0644);
+    }
 }
 
 static long long free_bytes(const char *dir) {
@@ -835,6 +856,7 @@ int main(void){
     signal(SIGINT,on_term);
 
     config_t cfg; load_config(&cfg);
+    umask(022);  /* slik at filer/mapper blir lesbare for SSH-bruker (0644/0755), ikke 0600/0700 */
     lg("=== %s %s starter ===",APP_NAME,APP_VERSION);
 
     /* finn en skrivbar lagringssti (SD foretrukket, intern flash som siste utvei) */
@@ -859,6 +881,7 @@ int main(void){
             }
         }
         if(!ok) lg("ADVARSEL: fant ingen skrivbar lagringssti (sjekk SD-kort + 'storage'-gruppe)");
+        else { repair_perms(cfg.output_dir); lg("Filrettigheter justert for lesetilgang (0644/0755)"); }
     }
 
 #ifndef HOST_TEST
