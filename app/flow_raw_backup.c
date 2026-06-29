@@ -54,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.1.6"
+#define APP_VERSION "1.1.7"
 
 /* ============================ logging ============================ */
 
@@ -457,7 +457,7 @@ static const char *DEFAULT_SETTINGS_JSON =
 "  \"poll_interval_seconds\": 120,\n"
 "  \"request_timeout_seconds\": 30,\n"
 "  \"output_dir\": \"/var/spool/storage/SD_DISK/flow_raw_backup\",\n"
-"  \"retention_days\": 14,\n"
+"  \"retention_days\": 0,\n"
 "  \"gzip\": true,\n"
 "  \"gzip_level\": 6\n"
 "}\n";
@@ -471,7 +471,7 @@ static void config_defaults(config_t *c) {
     c->poll_interval_seconds = 120;
     c->request_timeout_seconds = 30;
     snprintf(c->output_dir,sizeof(c->output_dir),"%s","/var/spool/storage/SD_DISK/flow_raw_backup");
-    c->retention_days = 14;
+    c->retention_days = 0;
     c->gzip = 1; c->gzip_level = 6;
 }
 
@@ -807,40 +807,8 @@ static void do_cycle(const config_t *c,session_t *s){
 }
 
 /* ---------------------------- retention ------------------------ */
-
-static void retention_sweep(const config_t *c){
-    if(c->retention_days<=0) return;
-    time_t cutoff=time(NULL)-(time_t)c->retention_days*86400;
-    DIR *d0=opendir(c->output_dir); if(!d0) return;
-    struct dirent *e0;
-    while((e0=readdir(d0))){
-        if(e0->d_name[0]=='.') continue;
-        char camdir[PATH_MAX]; snprintf(camdir,sizeof(camdir),"%s/%s",c->output_dir,e0->d_name);
-        struct stat st; if(stat(camdir,&st)!=0||!S_ISDIR(st.st_mode)) continue;
-        DIR *d1=opendir(camdir); if(!d1) continue;
-        struct dirent *e1;
-        while((e1=readdir(d1))){
-            if(e1->d_name[0]=='.') continue;
-            char sinkdir[PATH_MAX]; snprintf(sinkdir,sizeof(sinkdir),"%s/%s",camdir,e1->d_name);
-            if(stat(sinkdir,&st)!=0||!S_ISDIR(st.st_mode)) continue;
-            DIR *d2=opendir(sinkdir); if(!d2) continue;
-            struct dirent *e2;
-            while((e2=readdir(d2))){
-                if(e2->d_name[0]=='.') continue;
-                struct tm tmd; memset(&tmd,0,sizeof(tmd));
-                if(!strptime(e2->d_name,"%Y-%m-%d",&tmd)) continue;
-                time_t dayt=timegm(&tmd);
-                if(dayt>=cutoff) continue;
-                char daydir[PATH_MAX]; snprintf(daydir,sizeof(daydir),"%s/%s",sinkdir,e2->d_name);
-                DIR *d3=opendir(daydir); if(d3){ struct dirent*e3; while((e3=readdir(d3))){ if(e3->d_name[0]=='.')continue; char f[PATH_MAX]; snprintf(f,sizeof(f),"%s/%s",daydir,e3->d_name); unlink(f);} closedir(d3);} 
-                if(rmdir(daydir)==0) lg("Retention: slettet %s",daydir);
-            }
-            closedir(d2);
-        }
-        closedir(d1);
-    }
-    closedir(d0);
-}
+/* Automatisk sletting er deaktivert: innsamlede data beholdes paa SD-kortet
+ * uavhengig av alder, og slettes kun manuelt etter sikkerhetskopiering. */
 
 /* ------------------------------ main --------------------------- */
 
@@ -1002,8 +970,9 @@ int main(void){
 #endif
 
     session_t s; memset(&s,0,sizeof(s));
-    time_t last_retention=0;
-    char active_dir[256]=""; int warned_no_sd=0;
+    char active_dir[256]=""; int warned_no_sd=0; int low_warn_level=0;
+    const long long LOW1=10LL*1024*1024*1024;  /* 10 GB: tidlig heads-up */
+    const long long LOW2=2LL*1024*1024*1024;    /* 2 GB: kritisk */
     while(!g_stop){
         if(ensure_sd_storage(&cfg)){
             warned_no_sd=0;
@@ -1016,10 +985,16 @@ int main(void){
                 long long fb=free_bytes(cfg.output_dir);
                 lg("Lagring OK (SD): %s (ledig: %lld MB)",cfg.output_dir,fb>0?fb/1048576:-1);
                 lg("Filrettigheter justert for lesetilgang (0644/0755)");
+                lg("Automatisk sletting AV — data beholdes uavhengig av alder (slett manuelt etter backup).");
             }
             do_cycle(&cfg,&s);
-            time_t now=time(NULL);
-            if(cfg.retention_days>0 && now-last_retention>3600){ retention_sweep(&cfg); last_retention=now; }
+            /* plass-varsling: ingenting slettes automatisk, saa varsle naar kortet fylles */
+            long long fb=free_bytes(cfg.output_dir);
+            if(fb>=0 && fb<LOW2){
+                lg("KRITISK: kun %lld MB ledig paa SD — ta backup og rydd manuelt NAA, ellers stopper ny lagring naar kortet er fullt.",fb/1048576);
+            } else if(fb>=0 && fb<LOW1){
+                if(low_warn_level<1){ lg("ADVARSEL: %lld MB ledig paa SD — planlegg backup + manuell opprydding snart.",fb/1048576); low_warn_level=1; }
+            } else { low_warn_level=0; }
         } else {
             /* SD utilgjengelig -> skriv til begrenset noedbuffer paa intern flash */
             if(!warned_no_sd){
