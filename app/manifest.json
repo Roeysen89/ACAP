@@ -1,0 +1,13 @@
+{
+    "schemaVersion": "1.7.3",
+    "acapPackageConf": {
+        "setup": {
+            "friendlyName": "FLOW Raw Backup",
+            "appName": "flow_raw_backup",
+            "vendor": "Custom",
+            "version": "1.0.0",
+            "runMode": "respawn",
+            "embeddedSdkVersion": "3.0"
+        }
+    }
+}
