@@ -54,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.1.2"
 
 /* ============================ logging ============================ */
 
@@ -527,7 +527,7 @@ static int http_request(const char *method,const char *url,const char *const *he
     curl_easy_setopt(ch,CURLOPT_SSL_VERIFYPEER,0L);
     curl_easy_setopt(ch,CURLOPT_SSL_VERIFYHOST,0L);
     curl_easy_setopt(ch,CURLOPT_TIMEOUT,(long)timeout);
-    curl_easy_setopt(ch,CURLOPT_CONNECTTIMEOUT,(long)timeout);
+    curl_easy_setopt(ch,CURLOPT_CONNECTTIMEOUT,5L); /* rask feiling hvis FLOW ikke er oppe */
     curl_easy_setopt(ch,CURLOPT_WRITEFUNCTION,wr_cb);
     curl_easy_setopt(ch,CURLOPT_WRITEDATA,&mb);
     curl_easy_setopt(ch,CURLOPT_HEADERFUNCTION,hd_cb);
@@ -560,9 +560,8 @@ static int http_request(const char *method,const char *url,const char *const *he
 }
 #endif
 
-/* base candidates: configured first, then loopback/LAN/docker-bridge, https+http.
- * FLOW kjorer i Docker-containere (172.17-19.x) paa kameraet, saa vi proever
- * ogsaa bro-adressene. */
+/* base candidates: configured first, then loopback/LAN, https+http.
+ * Kort tilkoblings-timeout gjoer at doede kandidater feiler raskt. */
 #ifndef HOST_TEST
 static void add_base(char bases[][256], int *n, int max, const char *b){
     if(*n>=max) return;
@@ -588,11 +587,9 @@ static int collect_bases(const config_t *c,char bases[][256],int max){
         }
         freeifaddrs(ifa);
     }
-    const char *dg[]={"172.17.0.1","172.18.0.1","172.19.0.1"};
-    for(int i=0;i<3;i++){
-        snprintf(tmp,sizeof(tmp),"https://%s:%d",dg[i],port); add_base(bases,&n,max,tmp);
-        snprintf(tmp,sizeof(tmp),"http://%s:%d",dg[i],port);  add_base(bases,&n,max,tmp);
-    }
+    /* Docker-bro-adressene ble fjernet i v1.1.2: FLOW svarer alltid paa
+       127.0.0.1:8088, og bro-IP-ene er rutbare men doede paa 8088, noe som
+       ga 30s timeout hver under FLOW-oppstart. */
     return n;
 }
 #else
