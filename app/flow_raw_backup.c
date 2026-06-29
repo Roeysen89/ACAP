@@ -54,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.1.3"
+#define APP_VERSION "1.1.5"
 
 /* ============================ logging ============================ */
 
@@ -844,6 +844,126 @@ static void retention_sweep(const config_t *c){
 
 /* ------------------------------ main --------------------------- */
 
+#ifndef EMERG_DIR
+#define EMERG_DIR "/usr/local/packages/flow_raw_backup/localdata/data"
+#endif
+#ifndef EMERG_CAP_BYTES
+#define EMERG_CAP_BYTES (100LL*1024*1024)   /* 100 MB nødbuffer-tak */
+#endif
+#ifndef EMERG_MIN_FREE
+#define EMERG_MIN_FREE  (8LL*1024*1024)      /* hold alltid >=8 MB ledig paa flash */
+#endif
+
+/* flytt en fil (samme eller paa tvers av filsystem) */
+static int move_file(const char *src, const char *dst){
+    if(rename(src,dst)==0) return 0;
+    if(errno!=EXDEV) return -1;
+    int in=open(src,O_RDONLY); if(in<0) return -1;
+    char tmp[PATH_MAX]; snprintf(tmp,sizeof(tmp),"%s.tmp",dst);
+    int out=open(tmp,O_WRONLY|O_CREAT|O_TRUNC,0644); if(out<0){ close(in); return -1; }
+    fchmod(out,0644);
+    char b[65536]; ssize_t r; int ok=1;
+    while((r=read(in,b,sizeof(b)))>0){ ssize_t off=0; while(off<r){ ssize_t w=write(out,b+off,r-off); if(w<0){ ok=0; break; } off+=w; } if(!ok) break; }
+    if(r<0) ok=0;
+    fsync(out); close(out); close(in);
+    if(!ok){ unlink(tmp); return -1; }
+    if(rename(tmp,dst)!=0){ unlink(tmp); return -1; }
+    unlink(src);
+    return 0;
+}
+
+/* flytt alle _poll.*-filer fra nødbuffer til SD, behold mappestruktur */
+static int migrate_walk(const char *buf_base, const char *sd_base, const char *rel){
+    char dir[PATH_MAX];
+    if(rel[0]) snprintf(dir,sizeof(dir),"%s/%s",buf_base,rel); else snprintf(dir,sizeof(dir),"%s",buf_base);
+    DIR *d=opendir(dir); if(!d) return 0;
+    struct dirent *e; int moved=0;
+    while((e=readdir(d))){
+        if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue;
+        char childrel[PATH_MAX];
+        if(rel[0]) snprintf(childrel,sizeof(childrel),"%s/%s",rel,e->d_name); else snprintf(childrel,sizeof(childrel),"%s",e->d_name);
+        char full[PATH_MAX]; snprintf(full,sizeof(full),"%s/%s",buf_base,childrel);
+        struct stat st; if(stat(full,&st)!=0) continue;
+        if(S_ISDIR(st.st_mode)){
+            moved += migrate_walk(buf_base,sd_base,childrel);
+        } else if(S_ISREG(st.st_mode)){
+            if(strstr(e->d_name,"_poll.")){
+                char dst[PATH_MAX]; snprintf(dst,sizeof(dst),"%s/%s",sd_base,childrel);
+                char dstdir[PATH_MAX]; snprintf(dstdir,sizeof(dstdir),"%s",dst);
+                char *sl=strrchr(dstdir,'/'); if(sl){ *sl=0; mkpath(dstdir,0755); }
+                if(move_file(full,dst)==0) moved++;
+            } else {
+                unlink(full);  /* status.json, .wtest osv. */
+            }
+        }
+    }
+    closedir(d);
+    if(rel[0]) rmdir(dir);  /* fjern naa-tom mappe (ikke selve buffer-roten) */
+    return moved;
+}
+static void migrate_buffer_to_sd(const char *buf_base, const char *sd_base){
+    struct stat st; if(stat(buf_base,&st)!=0||!S_ISDIR(st.st_mode)) return;
+    int n=migrate_walk(buf_base,sd_base,"");
+    if(n>0) lg("Flyttet %d noed-bufrede filer fra intern flash til SD.",n);
+}
+
+/* samle filer (for tak-haandhevelse) */
+typedef struct { char path[PATH_MAX]; time_t mt; long long sz; } finfo;
+static void collect_files(const char *dir, finfo **arr, int *n, int *cap){
+    DIR *d=opendir(dir); if(!d) return;
+    struct dirent *e;
+    while((e=readdir(d))){
+        if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue;
+        char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/%s",dir,e->d_name);
+        struct stat st; if(stat(p,&st)!=0) continue;
+        if(S_ISDIR(st.st_mode)) collect_files(p,arr,n,cap);
+        else if(S_ISREG(st.st_mode) && strstr(e->d_name,"_poll.")){
+            if(*n>=*cap){ *cap=(*cap)?(*cap)*2:128; *arr=realloc(*arr,(*cap)*sizeof(finfo)); }
+            snprintf((*arr)[*n].path,PATH_MAX,"%s",p); (*arr)[*n].mt=st.st_mtime; (*arr)[*n].sz=(long long)st.st_size; (*n)++;
+        }
+    }
+    closedir(d);
+}
+static int cmp_mt(const void*a,const void*b){ const finfo*x=a,*y=b; return (x->mt<y->mt)?-1:(x->mt>y->mt)?1:0; }
+
+/* slett eldste filer til total <= tak OG ledig plass >= margin */
+static void enforce_cap(const char *base, long long max_bytes){
+    finfo *arr=NULL; int n=0,cap=0;
+    collect_files(base,&arr,&n,&cap);
+    if(n>1) qsort(arr,n,sizeof(finfo),cmp_mt);  /* eldste foerst */
+    long long total=0; for(int i=0;i<n;i++) total+=arr[i].sz;
+    int removed=0,i=0;
+    while(i<n && (total>max_bytes || free_bytes(base)<EMERG_MIN_FREE)){
+        if(unlink(arr[i].path)==0){ total-=arr[i].sz; removed++; }
+        i++;
+    }
+    if(removed>0) lg("Noedbuffer ryddet: slettet %d eldste filer (plass/tak).",removed);
+    free(arr);
+}
+
+/* Velg en skrivbar SD-sti. Returnerer 1 og setter cfg->output_dir, ellers 0.
+ * Skriver ALDRI til intern flash her — kun SD-kortet. */
+static int ensure_sd_storage(config_t *cfg){
+#ifdef HOST_TEST
+    if(getenv("FRB_NO_SD")) return 0;  /* testhjelp: simuler manglende SD */
+#endif
+    const char *cands[3]; int nc=0;
+    if(strstr(cfg->output_dir,"/storage/")) cands[nc++]=cfg->output_dir;  /* konfigurert SD-sti foerst */
+    cands[nc++]="/var/spool/storage/areas/SD_DISK/flow_raw_backup";
+    cands[nc++]="/var/spool/storage/SD_DISK/flow_raw_backup";
+    for(int i=0;i<nc;i++){
+        if(!cands[i]||!cands[i][0]) continue;
+        if(mkpath(cands[i],0755)!=0) continue;
+        char tf[PATH_MAX]; snprintf(tf,sizeof(tf),"%s/.wtest",cands[i]);
+        if(atomic_write(tf,(const unsigned char*)"ok",2)==0){
+            unlink(tf);
+            if(strcmp(cfg->output_dir,cands[i])!=0) snprintf(cfg->output_dir,sizeof(cfg->output_dir),"%s",cands[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static volatile sig_atomic_t g_stop=0;
 static void on_term(int sig){ (void)sig; g_stop=1; }
 
@@ -858,31 +978,6 @@ int main(void){
     config_t cfg; load_config(&cfg);
     umask(022);  /* slik at filer/mapper blir lesbare for SSH-bruker (0644/0755), ikke 0600/0700 */
     lg("=== %s %s starter ===",APP_NAME,APP_VERSION);
-
-    /* finn en skrivbar lagringssti (SD foretrukket, intern flash som siste utvei) */
-    {
-        const char *cands[4];
-        cands[0]=cfg.output_dir;
-        cands[1]="/var/spool/storage/areas/SD_DISK/flow_raw_backup";
-        cands[2]="/var/spool/storage/SD_DISK/flow_raw_backup";
-        cands[3]="/usr/local/packages/flow_raw_backup/localdata/data";
-        int ok=0;
-        for(int i=0;i<4;i++){
-            if(!cands[i]||!cands[i][0]) continue;
-            if(mkpath(cands[i],0755)!=0) continue;
-            char tf[PATH_MAX]; snprintf(tf,sizeof(tf),"%s/.wtest",cands[i]);
-            if(atomic_write(tf,(const unsigned char*)"ok",2)==0){
-                unlink(tf);
-                if(strcmp(cfg.output_dir,cands[i])!=0) snprintf(cfg.output_dir,sizeof(cfg.output_dir),"%s",cands[i]);
-                long long fb=free_bytes(cands[i]);
-                lg("Lagring OK: %s (ledig: %lld MB)%s",cands[i],fb>0?fb/1048576:-1,
-                   i==3?" [MERK: intern flash, kun midlertidig buffer]":"");
-                ok=1; break;
-            }
-        }
-        if(!ok) lg("ADVARSEL: fant ingen skrivbar lagringssti (sjekk SD-kort + 'storage'-gruppe)");
-        else { repair_perms(cfg.output_dir); lg("Filrettigheter justert for lesetilgang (0644/0755)"); }
-    }
 
 #ifndef HOST_TEST
     /* nettverkstest: naar vi kameraets egen webserver paa loopback? */
@@ -899,10 +994,35 @@ int main(void){
 
     session_t s; memset(&s,0,sizeof(s));
     time_t last_retention=0;
+    char active_dir[256]=""; int warned_no_sd=0;
     while(!g_stop){
-        do_cycle(&cfg,&s);
-        time_t now=time(NULL);
-        if(cfg.retention_days>0 && now-last_retention>3600){ retention_sweep(&cfg); last_retention=now; }
+        if(ensure_sd_storage(&cfg)){
+            warned_no_sd=0;
+            if(strcmp(active_dir,cfg.output_dir)!=0){
+                /* SD ble (re)etablert som aktiv (oppstart eller etter noed-modus):
+                 * flytt evt. gjenliggende noedbuffer fra flash til SD foerst. */
+                migrate_buffer_to_sd(EMERG_DIR, cfg.output_dir);
+                snprintf(active_dir,sizeof(active_dir),"%s",cfg.output_dir);
+                repair_perms(cfg.output_dir);
+                long long fb=free_bytes(cfg.output_dir);
+                lg("Lagring OK (SD): %s (ledig: %lld MB)",cfg.output_dir,fb>0?fb/1048576:-1);
+                lg("Filrettigheter justert for lesetilgang (0644/0755)");
+            }
+            do_cycle(&cfg,&s);
+            time_t now=time(NULL);
+            if(cfg.retention_days>0 && now-last_retention>3600){ retention_sweep(&cfg); last_retention=now; }
+        } else {
+            /* SD utilgjengelig -> skriv til begrenset noedbuffer paa intern flash */
+            if(!warned_no_sd){
+                lg("ADVARSEL: SD-kort ikke tilgjengelig — bruker noedbuffer paa intern flash (maks 100 MB). Sjekk SD-kortet.");
+                warned_no_sd=1;
+            }
+            active_dir[0]=0;
+            snprintf(cfg.output_dir,sizeof(cfg.output_dir),"%s",EMERG_DIR);
+            mkpath(cfg.output_dir,0755);
+            enforce_cap(EMERG_DIR, EMERG_CAP_BYTES);   /* frigjoer plass foer skriving */
+            do_cycle(&cfg,&s);
+        }
         int iv=cfg.poll_interval_seconds<15?15:cfg.poll_interval_seconds;
         for(int i=0;i<iv && !g_stop;i++) sleep(1);
     }
