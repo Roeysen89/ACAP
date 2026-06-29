@@ -46,6 +46,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
+#include <strings.h>
 #endif
 
 #ifndef PATH_MAX
@@ -53,7 +54,7 @@
 #endif
 
 #define APP_NAME    "flow-raw-backup"
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.1.0"
 
 /* ============================ logging ============================ */
 
@@ -559,25 +560,38 @@ static int http_request(const char *method,const char *url,const char *const *he
 }
 #endif
 
-/* base candidates: configured (loopback) first, then camera LAN IPs */
+/* base candidates: configured first, then loopback/LAN/docker-bridge, https+http.
+ * FLOW kjorer i Docker-containere (172.17-19.x) paa kameraet, saa vi proever
+ * ogsaa bro-adressene. */
 #ifndef HOST_TEST
+static void add_base(char bases[][256], int *n, int max, const char *b){
+    if(*n>=max) return;
+    for(int i=0;i<*n;i++) if(!strcmp(bases[i],b)) return;
+    snprintf(bases[(*n)++],256,"%s",b);
+}
 static int collect_bases(const config_t *c,char bases[][256],int max){
     int n=0,port=8088;
     const char *pc=strrchr(c->flow_base_url,':'); if(pc&&isdigit((unsigned char)pc[1])) port=atoi(pc+1);
-    snprintf(bases[n++],256,"%s",c->flow_base_url);
+    char tmp[256];
+    add_base(bases,&n,max,c->flow_base_url);
+    snprintf(tmp,sizeof(tmp),"https://127.0.0.1:%d",port); add_base(bases,&n,max,tmp);
+    snprintf(tmp,sizeof(tmp),"http://127.0.0.1:%d",port);  add_base(bases,&n,max,tmp);
     struct ifaddrs *ifa=NULL;
     if(getifaddrs(&ifa)==0){
         for(struct ifaddrs *p=ifa;p&&n<max;p=p->ifa_next){
             if(!p->ifa_addr||p->ifa_addr->sa_family!=AF_INET) continue;
             if(p->ifa_flags & IFF_LOOPBACK) continue;
             char ip[INET_ADDRSTRLEN];
-            struct sockaddr_in *sin=(struct sockaddr_in*)p->ifa_addr;
-            inet_ntop(AF_INET,&sin->sin_addr,ip,sizeof(ip));
-            char cand[256]; snprintf(cand,sizeof(cand),"https://%s:%d",ip,port);
-            int dup=0; for(int i=0;i<n;i++) if(!strcmp(bases[i],cand)){dup=1;break;}
-            if(!dup) snprintf(bases[n++],256,"%s",cand);
+            inet_ntop(AF_INET,&((struct sockaddr_in*)p->ifa_addr)->sin_addr,ip,sizeof(ip));
+            snprintf(tmp,sizeof(tmp),"https://%s:%d",ip,port); add_base(bases,&n,max,tmp);
+            snprintf(tmp,sizeof(tmp),"http://%s:%d",ip,port);  add_base(bases,&n,max,tmp);
         }
         freeifaddrs(ifa);
+    }
+    const char *dg[]={"172.17.0.1","172.18.0.1","172.19.0.1"};
+    for(int i=0;i<3;i++){
+        snprintf(tmp,sizeof(tmp),"https://%s:%d",dg[i],port); add_base(bases,&n,max,tmp);
+        snprintf(tmp,sizeof(tmp),"http://%s:%d",dg[i],port);  add_base(bases,&n,max,tmp);
     }
     return n;
 }
@@ -590,7 +604,7 @@ static int collect_bases(const config_t *c,char bases[][256],int max){ (void)max
 typedef struct { char base[256]; char token[2048]; char api_version[64]; char serial[64]; int have; } session_t;
 
 static int flow_login(const config_t *c,session_t *s){
-    char bases[16][256]; int nb=collect_bases(c,bases,16);
+    char bases[32][256]; int nb=collect_bases(c,bases,32);
     s->base[0]=0;
     for(int i=0;i<nb;i++){
         char url[512]; snprintf(url,sizeof(url),"%s%s",bases[i],c->block_info_path);
@@ -825,14 +839,43 @@ int main(void){
 
     config_t cfg; load_config(&cfg);
     lg("=== %s %s starter ===",APP_NAME,APP_VERSION);
-    lg("output_dir: %s",cfg.output_dir);
 
-    if(mkpath(cfg.output_dir,0755)==0){
-        char tf[PATH_MAX]; snprintf(tf,sizeof(tf),"%s/.write_test",cfg.output_dir);
-        if(atomic_write(tf,(const unsigned char*)"ok",2)==0){ unlink(tf); long long fb=free_bytes(cfg.output_dir);
-            lg("SD skrivbar OK (ledig: %lld MB)", fb>0?fb/1048576:-1); }
-        else lg("ADVARSEL: kan ikke skrive til output_dir — sjekk SD-sti (df -h / mount). Muligens kreves AXStorage-tilgang.");
-    } else lg("ADVARSEL: kan ikke opprette output_dir %s",cfg.output_dir);
+    /* finn en skrivbar lagringssti (SD foretrukket, intern flash som siste utvei) */
+    {
+        const char *cands[4];
+        cands[0]=cfg.output_dir;
+        cands[1]="/var/spool/storage/areas/SD_DISK/flow_raw_backup";
+        cands[2]="/var/spool/storage/SD_DISK/flow_raw_backup";
+        cands[3]="/usr/local/packages/flow_raw_backup/localdata/data";
+        int ok=0;
+        for(int i=0;i<4;i++){
+            if(!cands[i]||!cands[i][0]) continue;
+            if(mkpath(cands[i],0755)!=0) continue;
+            char tf[PATH_MAX]; snprintf(tf,sizeof(tf),"%s/.wtest",cands[i]);
+            if(atomic_write(tf,(const unsigned char*)"ok",2)==0){
+                unlink(tf);
+                if(strcmp(cfg.output_dir,cands[i])!=0) snprintf(cfg.output_dir,sizeof(cfg.output_dir),"%s",cands[i]);
+                long long fb=free_bytes(cands[i]);
+                lg("Lagring OK: %s (ledig: %lld MB)%s",cands[i],fb>0?fb/1048576:-1,
+                   i==3?" [MERK: intern flash, kun midlertidig buffer]":"");
+                ok=1; break;
+            }
+        }
+        if(!ok) lg("ADVARSEL: fant ingen skrivbar lagringssti (sjekk SD-kort + 'storage'-gruppe)");
+    }
+
+#ifndef HOST_TEST
+    /* nettverkstest: naar vi kameraets egen webserver paa loopback? */
+    {
+        http_resp r;
+        if(http_request("GET","https://127.0.0.1/axis-cgi/usergroup.cgi",NULL,0,NULL,0,5,&r)==0){
+            lg("Nettverk: naadde kameraets webserver paa loopback (HTTP %ld) — nettverkstilgang OK",r.status);
+            http_free(&r);
+        } else {
+            lg("Nettverk: naadde IKKE kameraets egen webserver paa loopback — appen mangler kanskje nettverkstilgang");
+        }
+    }
+#endif
 
     session_t s; memset(&s,0,sizeof(s));
     time_t last_retention=0;
